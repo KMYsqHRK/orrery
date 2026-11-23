@@ -25,7 +25,7 @@ const XTERM_THEME = {
   brightMagenta: '#c9a6ea', brightCyan: '#7fc8ba', brightWhite: '#fffaf0',
 };
 
-let state = {agents: [], portraits: []};
+let state = {agents: []};
 // ?agent=NAME opens that agent (links, screenshots); otherwise the last one viewed.
 let selected = new URLSearchParams(location.search).get('agent')
   || localStorage.getItem('orrery-win.selected') || null;
@@ -50,25 +50,16 @@ function el(tag, props = {}, ...children) {
   return node;
 }
 
-function svg(tag, attrs = {}, ...children) {
-  const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
-  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
-  for (const child of children) if (child != null) node.append(child);
-  return node;
-}
-
 function same(a, b) { return a != null && b != null && a.toLowerCase() === b.toLowerCase(); }
 function current() { return state.agents.find((a) => same(a.name, selected)) || null; }
 function agentNamed(name) { return state.agents.find((a) => same(a.name, name)) || null; }
 function stateOf(agent) { return agent.status === 'running' ? agent.activity : agent.status; }
 
-// A stable portrait per name, from the repository's public-domain set.
+// The host picks each agent's portrait (host/portraits.py): its namesake's
+// from the repository's public-domain set, or a stable one by hash.
 function portraitFor(name) {
-  const list = state.portraits || [];
-  if (!list.length || !agentNamed(name)) return null;
-  let hash = 0;
-  for (const ch of name.toLowerCase()) hash = (hash * 31 + ch.codePointAt(0)) >>> 0;
-  return `/portraits/${encodeURIComponent(list[hash % list.length])}.png`;
+  const agent = agentNamed(name);
+  return agent && agent.portrait ? `/portraits/${encodeURIComponent(agent.portrait)}.png` : null;
 }
 
 function face(name, cls = 'face') {
@@ -159,6 +150,7 @@ function select(name) {
   localStorage.setItem('orrery-win.selected', name);
   renderRoster();
   renderStage();
+  document.dispatchEvent(new CustomEvent('win:select', {detail: {name}}));
   const view = terminals.get(name.toLowerCase());
   if (view) requestAnimationFrame(() => fitView(view));
 }
@@ -284,8 +276,8 @@ let lastMail = '';
 async function refreshMail() {
   const {messages} = await api('GET', '/api/mail/recent?limit=100');
   mailMessages = messages;
+  document.dispatchEvent(new CustomEvent('win:mail', {detail: {messages}}));
   const signature = messages.map((m) => m.id).join(',') + '|' + mailFilter + '|' + [...openMail].join(',');
-  renderOrbit();
   if (signature === lastMail) return;
   lastMail = signature;
   renderChips();
@@ -338,56 +330,17 @@ function renderMail() {
   if (!shown.length) list.append(el('li', {className: 'hint', textContent: 'まだメールはありません。'}));
 }
 
-// Agents on an orbit; a line for each pair that has written, thicker for
-// more messages and brighter for recent ones. Only agents on the roster get a
-// node: mail outlives a removed agent, and its name should not linger here.
-function renderOrbit() {
-  const box = $('orbit');
-  const names = state.agents.map((agent) => agent.name);
-  const cx = 150, cy = 85, rx = 112, ry = 58;
-  const nodes = new Map(names.map((name, i) => {
-    const angle = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(names.length, 1);
-    return [name.toLowerCase(), {name, x: cx + rx * Math.cos(angle), y: cy + ry * Math.sin(angle)}];
-  }));
-  const pairs = new Map();
-  const now = Date.now();
-  for (const m of mailMessages) {
-    for (const r of (m.recipients || '').split(', ')) {
-      if (!r) continue;
-      const key = [m.sender.toLowerCase(), r.toLowerCase()].sort().join('|');
-      const entry = pairs.get(key) || {count: 0, last: 0};
-      entry.count += 1;
-      entry.last = Math.max(entry.last, new Date(m.ts).getTime());
-      pairs.set(key, entry);
-    }
-  }
-  const parts = [svg('ellipse', {class: 'ring', cx, cy, rx, ry}),
-    svg('ellipse', {class: 'ring', cx, cy, rx: rx * 0.55, ry: ry * 0.55})];
-  for (const [key, {count, last}] of pairs) {
-    const [a, b] = key.split('|').map((n) => nodes.get(n));
-    if (!a || !b || a === b) continue;
-    const fresh = Math.max(0.15, 1 - (now - last) / 600000);  // Fades over ten minutes.
-    parts.push(svg('line', {class: 'edge', x1: a.x, y1: a.y, x2: b.x, y2: b.y,
-      'stroke-width': Math.min(1 + count * 0.5, 4), 'stroke-opacity': fresh.toFixed(2)}));
-  }
-  names.forEach((name, i) => {
-    const node = nodes.get(name.toLowerCase());
-    const agent = agentNamed(name);
-    const busy = agent && stateOf(agent) === 'busy' ? ' busy' : '';
-    const id = `clip-${i}`;
-    parts.push(svg('circle', {class: `node-ring${busy}`, cx: node.x, cy: node.y, r: 13}));
-    const src = portraitFor(name);
-    if (src) {
-      parts.push(svg('clipPath', {id}, svg('circle', {cx: node.x, cy: node.y, r: 11.5})));
-      parts.push(svg('image', {href: src, x: node.x - 11.5, y: node.y - 11.5, width: 23, height: 23,
-        'clip-path': `url(#${id})`, style: 'filter:grayscale(1)'}));
-    } else {
-      parts.push(svg('text', {class: 'initial', x: node.x, y: node.y}, document.createTextNode(name[0].toUpperCase())));
-    }
-    parts.push(svg('text', {class: 'node-label', x: node.x, y: node.y + 23}, document.createTextNode(name)));
-  });
-  box.replaceChildren(...parts);
-}
+// The graph above the mail is the original cockpit's bridge/orrery_view.js,
+// fed through web/oc.js. This page only tells it what changed:
+//   'win:state' {state}     after every roster poll
+//   'win:mail'  {messages}  after every mail poll (newest first, as the API gives)
+//   'win:select' {name}     when the stage shows another agent
+// and lets it steer back through window.OrreryWin.
+window.OrreryWin = Object.freeze({
+  selected: () => selected,
+  select: (name) => { if (agentNamed(name)) select(agentNamed(name).name); },
+  filterMail: (name) => { mailFilter = name; refreshMail().catch(() => {}); },
+});
 
 // State ------------------------------------------------------------------
 
@@ -411,6 +364,7 @@ async function refresh() {
   renderSummary();
   renderRoster();
   renderStage();
+  document.dispatchEvent(new CustomEvent('win:state', {detail: {state}}));
   refreshMail().catch(() => {});
 }
 
@@ -441,17 +395,37 @@ $('create-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = new FormData(event.target);
   try {
-    await api('POST', '/api/agents', {
+    // A blank name is fine: the host then picks a scientist's name.
+    const created = await api('POST', '/api/agents', {
       name: form.get('name').trim(), program: form.get('program'), cwd: form.get('cwd').trim(),
       resume: form.get('resume') === 'on', start: true, ...size(),
     });
     $('create').close();
     event.target.reset();
-    selected = form.get('name').trim();
+    selected = created.name;
     await refresh();
   } catch (error) {
     $('create-error').textContent = error.message;
     $('create-error').hidden = false;
+  }
+});
+
+// 参照…: the host opens Windows' own folder dialog on this desktop (a page
+// cannot learn a folder's full path itself). It starts from what is typed,
+// else the folder of the agent on stage.
+$('browse').addEventListener('click', async () => {
+  const input = $('create-form').elements.cwd;
+  const button = $('browse');
+  button.disabled = true;
+  $('create-error').hidden = true;
+  try {
+    const {path} = await api('POST', '/api/pick-folder', {initial: input.value.trim() || (current() || {}).cwd || ''});
+    if (path) input.value = path;
+  } catch (error) {
+    $('create-error').textContent = error.message;
+    $('create-error').hidden = false;
+  } finally {
+    button.disabled = false;
   }
 });
 
