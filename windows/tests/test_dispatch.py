@@ -33,6 +33,13 @@ AGY_TRUST = ["Do you trust the contents of this project?", "> Yes, I trust this 
 CLAUDE_IDLE = [" ▐▛███▜▌   Claude Code v2.1", RULE, '❯ Try "fix lint errors"', RULE,
                "  ⏵⏵ auto mode on (shift+tab to cycle)"]
 CLAUDE_BUSY = ["❯ do the thing", "✻ Thinking… (esc to interrupt)", RULE, "❯", RULE]
+# Claude Code can draw its prompt as ">" (read from a live agent, 2.1.330).
+CLAUDE_IDLE_GT = ["> あれ，動いてる？", "", "● 動いています。", "",
+                  "✻ Cogitated for 1m 1s · done 22:50", "", RULE, "> ", RULE,
+                  "  ⏵⏵ auto mode on (shift+tab to cycle)"]
+# Old prompts and quoted lines in the scrollback are not the live prompt.
+CLAUDE_NO_PROMPT = ["> あれ，動いてる？", "", "● 引用します:", "  > a quoted line", "",
+                    "  ⏵⏵ auto mode on (shift+tab to cycle)"]
 CLAUDE_PERMISSION = ["Do you want to proceed?", "❯ 1. Yes", "  2. No"]
 CLAUDE_TRUST = [" Quick safety check: Is this a project you created or one you trust?",
                 " ❯ No, exit", "   Yes, I trust this folder", " Enter to confirm · Esc to cancel"]
@@ -50,6 +57,54 @@ class ScreenStateTest(unittest.TestCase):
         self.assertEqual(activity.screen_state("claude", CLAUDE_BUSY), "busy")
         self.assertEqual(activity.screen_state("claude", CLAUDE_PERMISSION), "dialog")
         self.assertEqual(activity.screen_state("claude", CLAUDE_TRUST), "dialog")
+
+    def test_claude_prompt_mark_greater_than(self):
+        self.assertEqual(activity.screen_state("claude", CLAUDE_IDLE_GT), "idle")
+        typed = CLAUDE_IDLE_GT[:-3] + [RULE, "> writerのノートできた？", RULE, CLAUDE_IDLE_GT[-1]]
+        self.assertEqual(activity.screen_state("claude", typed), "idle")
+        self.assertEqual(activity.screen_state("claude", CLAUDE_NO_PROMPT), "unclear")
+
+
+class ClaudeActivityTest(unittest.TestCase):
+    """The screen's busy marker beats a hook; a screen it cannot read does not."""
+
+    def setUp(self):
+        from host.sessions import Session
+
+        self.now = 1_000_000.0
+        self.session = Session("tech", asyncio.new_event_loop(), "claude")
+        self.session.status, self.session.started_ts = "running", self.now - 600
+        self.session.last_output = self.now - 5
+        self.rows = CLAUDE_NO_PROMPT
+        self.session.screen_rows = lambda: self.rows
+
+    def tearDown(self):
+        self.session.loop.close()
+
+    def state(self, hook):
+        self.session.hook_state = hook
+        return self.session.refresh(self.now)
+
+    def test_stop_hook_wins_over_an_unclear_screen(self):
+        self.assertEqual(self.state("idle"), "idle")
+
+    def test_unclear_screen_without_a_stop_stays_busy(self):
+        self.assertEqual(self.state("busy"), "busy")
+        self.session.last_output = self.now - 120  # Long quiet, still no prompt seen.
+        self.assertEqual(self.state("busy"), "busy")
+        self.assertEqual(self.state(None), "busy")  # No hooks at all: never guess idle.
+
+    def test_busy_marker_and_dialog_still_beat_the_hook(self):
+        self.rows = CLAUDE_BUSY
+        self.assertEqual(self.state("idle"), "busy")
+        self.rows = CLAUDE_PERMISSION
+        self.assertEqual(self.state("idle"), "attention")
+
+    def test_prompt_on_screen_is_idle(self):
+        self.rows = CLAUDE_IDLE_GT
+        self.assertEqual(self.state("idle"), "idle")
+        self.session.last_output = self.now - 120  # Interrupted turn: no Stop came.
+        self.assertEqual(self.state("busy"), "idle")
 
 
 class TypedTest(unittest.TestCase):
