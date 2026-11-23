@@ -7,6 +7,8 @@ import subprocess
 
 import pytest
 
+from test_preview_markdown_document import run as run_markdown
+
 BRIDGE = Path(__file__).resolve().parents[1]
 
 
@@ -36,21 +38,63 @@ def test_mail_fields_and_markdown_use_only_fixed_markup():
     cockpit = (BRIDGE / 'cockpit.html').read_text()
     mail = (BRIDGE / 'mail_view.js').read_text()
     escape = next(line for line in cockpit.splitlines() if line.startswith('function esc('))
-    helpers = mail[mail.index('function E('):mail.index('function keyOf(')]
-    renderer = mail[mail.index('function plainMarkdownLinks('):mail.index('function threadHtml(')]
+    helpers = mail[mail.index('const icons='):mail.index('function normalizeRecipient(')]
+    labels = mail[mail.index('function clock('):mail.index('function directRecipients(')]
+    renderer = mail[mail.index('function peerHtml('):mail.index('function renderDrawer(')]
     value = '<img src=x onerror="marker()"> & "quoted"'
-    script = escape + '\nconst OC={esc};\n' + helpers + '\n' + renderer
-    script += '\nfunction exactTime(){return "time";} function relativeLabel(){return "time";}'
-    script += '\nfunction highImportance(value){return value==="high"||value==="urgent";}'
+    script = '\nconst OC={esc:(' + escape + ')};\n' + helpers + labels + renderer
     script += '\nconst value=' + json.dumps(value) + ';'
-    script += '\nconsole.log(JSON.stringify(detailHtml({sender:value,recipients:[{name:value,kind:value}],subject:value,importance:value,body_md:"**bold** `code`\\n"+value+"\\n[label](javascript:marker())"})));'
-    rendered = run_js(script)
+    script += r"""
+const message = {
+  key: value, sender: value, recipients: [{name: value, kind: value}],
+  subject: value, excerpt: value, ts: 2000000000,
+  body_md: "**bold** `code`\n" + value + "\n[label](javascript:marker())"
+};
+const body = new Element('div');
+Object.defineProperty(Element.prototype, 'innerHTML', {
+  set() { throw new Error('Mail Markdown must build DOM nodes'); }
+});
+body.classList = {add(){}, remove(){}, toggle(){}};
+body.replaceChildren = () => { body.children = []; };
+const drawerBody = {querySelector: () => body};
+let paintedBody = null, observingPaths = false;
+const loadCockpitMarkdown = async () => {};
+globalThis.window = {OrreryConversationMarkdown: md};
+const OrreryConversationSource = {Source: class {}};
+renderDrawerBody(message);
+const fallback = body.textContent;
+Promise.resolve().then(() => console.log(JSON.stringify([detailHtml(message), replyHtml(message, true), drawerLinkSource({
+  request: message, replies: [message], inferred: [], followups: []
+}), body.html(), fallback, message.body_md])));
+"""
+    allowed = {
+        'div': {'class'}, 'span': {'class', 'title', 'role', 'aria-label', 'aria-hidden', 'data-mail-peer'},
+        'h2': set(), 'p': set(), 'code': set(), 'strong': set(),
+        'time': {'title'}, 'button': {'class', 'type', 'data-reply'},
+        'svg': {'class', 'viewbox', 'aria-hidden'}, 'path': {'d'}, 'circle': {'cx', 'cy', 'r'},
+    }
+    details, reply, link, body, fallback, original = json.loads(run_markdown(script))
+    assert fallback == original
+    for rendered in (details, reply, link):
+        parsed = Tags()
+        parsed.feed(rendered)
+        assert all(tag in allowed and set(attrs) <= allowed[tag] for tag, attrs in parsed.tags)
+        assert 'javascript:' not in rendered
+
     parsed = Tags()
-    parsed.feed(rendered)
-    assert {tag for tag, _ in parsed.tags} <= {'div', 'span', 'h2', 'p', 'code', 'strong'}
-    assert all(set(attrs) <= {'class'} for _, attrs in parsed.tags)
+    parsed.feed(details)
+    assert ''.join(parsed.text).count(value) == 3  # sender, recipient and subject
+    assert ('span', {'class': 'mail-peer', 'title': value.upper()}) in parsed.tags
+    assert [attrs['data-mail-peer'] for _, attrs in parsed.tags if 'data-mail-peer' in attrs] == [value, value]
+    parsed = Tags()
+    parsed.feed(reply)
+    assert parsed.tags[0] == ('button', {'class': 'thread-item', 'type': 'button', 'data-reply': value})
+    assert ''.join(parsed.text).count(value) == 3  # sender, recipient and excerpt
+    parsed = Tags()
+    parsed.feed(body)
+    assert all(tag in allowed and set(attrs) <= allowed[tag] for tag, attrs in parsed.tags)
+    assert ('strong', {}) in parsed.tags and ('code', {}) in parsed.tags
     assert value in ''.join(parsed.text)
-    assert 'javascript:' not in rendered
 
 
 def test_composer_warning_escapes_the_complete_word():
